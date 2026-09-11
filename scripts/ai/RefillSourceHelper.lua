@@ -16,10 +16,11 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ]]
 
---- Helper functions for finding a nearby fill source (tank trailer, slurry pit, field edge
---- container) that a slurry/digestate spreader can drive to in order to refill its tank.
---- The list of candidate sources is taken from the sprayer's own fillTypeSources, which the
---- base game already scanned and matched to the sprayer's supported spray types.
+--- Helper functions for finding a nearby fill source (usually a slurry/digestate tank trailer)
+--- that a slurry/digestate spreader can drive to in order to refill its tank.
+--- The base game does NOT populate the sprayer's fillTypeSources with tank trailers on the map,
+--- so we scan all mission vehicles for one that has a fill unit matching the sprayer's spray
+--- types, that actually contains fluid, and that is stopped near the field.
 ---@class RefillSourceHelper
 RefillSourceHelper = {}
 RefillSourceHelper.debugChannel = CpDebug.DBG_FIELDWORK
@@ -45,27 +46,35 @@ function RefillSourceHelper:findBestFillSource(fieldPolygon, myVehicle, sprayer)
     end
 
     local sprayerSpec = sprayer.spec_sprayer
-    local seen = {}
+    -- the fill types this sprayer can be refilled with (e.g. LIQUIDMANURE, DIGESTATE)
+    local wantedFillTypes = {}
+    for _, sprayType in ipairs(sprayerSpec.supportedSprayTypes) do
+        wantedFillTypes[sprayType] = true
+    end
+
     local bestSource, bestFillUnitIndex, bestFillNode
     local minDistance = math.huge
 
-    for _, sprayType in ipairs(sprayerSpec.supportedSprayTypes) do
-        local sources = sprayerSpec.fillTypeSources[sprayType]
-        if sources then
-            for _, src in ipairs(sources) do
-                local source = src.vehicle
-                local fillUnitIndex = src.fillUnitIndex
-                if source and source ~= nil then
-                    local key = tostring(source) .. '|' .. tostring(fillUnitIndex)
-                    if seen[key] == nil then
-                        seen[key] = true
-                        local fillNode, distance = self:checkSource(myVehicle, fieldPolygon, source, fillUnitIndex)
-                        if fillNode and distance < minDistance then
-                            minDistance = distance
-                            bestSource = source
-                            bestFillUnitIndex = fillUnitIndex
-                            bestFillNode = fillNode
+    for _, otherVehicle in pairs(g_currentMission.vehicleSystem.vehicles) do
+        if otherVehicle ~= sprayer and otherVehicle.getFillUnits then
+            local fillUnits = otherVehicle:getFillUnits()
+            for i = 1, #fillUnits do
+                local canSupply = false
+                if otherVehicle.getFillUnitSupportsFillType then
+                    for sprayType, _ in pairs(wantedFillTypes) do
+                        if otherVehicle:getFillUnitSupportsFillType(i, sprayType) then
+                            canSupply = true
+                            break
                         end
+                    end
+                end
+                if canSupply then
+                    local fillNode, distance = self:checkSource(myVehicle, fieldPolygon, otherVehicle, i)
+                    if fillNode and distance < minDistance then
+                        minDistance = distance
+                        bestSource = otherVehicle
+                        bestFillUnitIndex = i
+                        bestFillNode = fillNode
                     end
                 end
             end

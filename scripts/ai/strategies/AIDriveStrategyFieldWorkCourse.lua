@@ -846,12 +846,14 @@ function AIDriveStrategyFieldWorkCourse:updateRefillFilling()
     local capacity = sprayer:getFillUnitCapacity(fillUnitIndex)
     local fillDelta = curLevel - self.refillStartFillLevel
     local percentageFilled = capacity > 0 and (fillDelta / capacity) * 100 or 0
+    -- absolute tank level: used to decide when the tank itself is (almost) full
+    local fillPercentage = capacity > 0 and (curLevel / capacity) * 100 or 0
     local noIncreaseTime = now - self.refillLastIncreaseTime
     local totalFillTime = now - self.refillStartTime
 
     local done = false
-    if percentageFilled >= AIDriveStrategyFieldWorkCourse.refillFullLevelPercentage then
-        self:debug('Refill: tank is full (%.1f%%), stopping fill.', percentageFilled)
+    if fillPercentage >= AIDriveStrategyFieldWorkCourse.refillFullLevelPercentage then
+        self:debug('Refill: tank is full (%.1f%%), stopping fill.', fillPercentage)
         done = true
     elseif percentageFilled >= AIDriveStrategyFieldWorkCourse.refillMinFilledPercentage
             and noIncreaseTime >= AIDriveStrategyFieldWorkCourse.refillNoIncreaseTimeoutMs then
