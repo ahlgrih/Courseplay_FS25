@@ -6,6 +6,18 @@ local CurvedPathHelper = {}
 
 local logger = Logger('CurvedPathHelper')
 
+local maxAngleDelta = 30 -- degrees, max deviation from the reference travel direction
+
+-- heading (radians) of the edge from a to b, i.e. the direction of travel a -> b
+local function edgeHeading(a, b)
+    return (b - a):heading()
+end
+
+-- true if the current travel direction has rotated more than maxAngleDelta from the reference
+local function exceedsMaxAngleDelta(reference, current)
+    return math.deg(math.abs(CpMathUtil.getDeltaAngle(reference, current))) > maxAngleDelta
+end
+
 ---@param boundary Polygon the boundary, usually headland or virtual headland. Rows must cover the area within the
 --- boundary - working width / 2
 ---@param baselineLocation Vector the field edge closest to this location will be the one the generated rows follow
@@ -70,16 +82,22 @@ end
 ---@param section CourseGenerator.Row empty row passed in to hold the straight section around ix
 ---@return CourseGenerator.Row the straight section as a row, same object as passed in as the section
 function CurvedPathHelper.findLongestStraightSection(boundary, ix, radiusThreshold, section)
-    local i, n, j = ix, 1
-    -- max one round only (n <) self:at(currentIx):getXte(r)
-    while n < #boundary and boundary:at(i):getRadius() > radiusThreshold do
+    local i, n = ix, 1
+    -- reference travel direction for the backward walk: at(ix) -> at(ix-1)
+    local reference = edgeHeading(boundary:at(ix), boundary:at(ix - 1))
+    while n < #boundary and boundary:at(i):getRadius() > radiusThreshold
+        and (#section == 0 or not exceedsMaxAngleDelta(reference, edgeHeading(boundary:at(i + 1), boundary:at(i)))) do
         section:append((boundary:at(i)):clone())
         i = i - 1
         n = n + 1
     end
     section:reverse()
-    j, n = ix + 1, 1
-    while n < #boundary and boundary:at(j):getRadius() > radiusThreshold do
+    local j = ix + 1
+    n = 1
+    -- reference travel direction for the forward walk: at(ix) -> at(ix+1)
+    reference = edgeHeading(boundary:at(ix), boundary:at(ix + 1))
+    while n < #boundary and boundary:at(j):getRadius() > radiusThreshold
+        and (#section == 0 or not exceedsMaxAngleDelta(reference, edgeHeading(boundary:at(j - 1), boundary:at(j)))) do
         section:append((boundary:at(j)):clone())
         j = j + 1
         n = n + 1
