@@ -21,6 +21,14 @@ function CpAITaskFieldWork:setWaitingForRefillingActive()
 	end
 end
 
+--- Ask the drive strategy to start driving to a nearby fill source and back (active refill mode).
+function CpAITaskFieldWork:startRefillSequence()
+	local cpSpec = self.vehicle.spec_cpAIFieldWorker
+	if cpSpec and cpSpec.driveStrategy and cpSpec.driveStrategy.startRefillSequence then
+		cpSpec.driveStrategy:startRefillSequence()
+	end
+end
+
 function CpAITaskFieldWork:update(dt)
 	-- Hack to reevaluate the refill condition for the new setting state after it changed.
 	local settingWasChanged = false

@@ -507,10 +507,22 @@ function CpVehicleSettings:generateSpeedSettingValuesAndTexts(setting, lastValue
 end
 
 function CpVehicleSettings:isRefillOnTheFieldSettingVisible()
-    return AIUtil.hasChildVehicleWithSpecialization(self, Sprayer) or 
-        AIUtil.hasChildVehicleWithSpecialization(self, SowingMachine) or 
-        AIUtil.hasChildVehicleWithSpecialization(self, TreePlanter) or 
+    return AIUtil.hasChildVehicleWithSpecialization(self, Sprayer) or
+        AIUtil.hasChildVehicleWithSpecialization(self, SowingMachine) or
+        AIUtil.hasChildVehicleWithSpecialization(self, TreePlanter) or
         CpVehicleSettings.isAdditiveFillUnitSettingVisible(self)
+end
+
+--- The "active" refill mode (drive to a fill source and back) only makes sense for slurry/digestate
+--- spreaders that can be refilled from a nearby source. Hide it for every other vehicle, so it only
+--- shows up where the automatic refill driving is supported.
+function CpVehicleSettings:isRefillOnTheFieldActiveDisabled()
+    local sprayers, found = AIUtil.getAllChildVehiclesWithSpecialization(self, Sprayer)
+    if found and sprayers[1] and sprayers[1].spec_sprayer then
+        local spec = sprayers[1].spec_sprayer
+        return not (spec.isSlurryTanker or spec.isManureSpreader)
+    end
+    return true
 end
 
 ---------------------------------------------

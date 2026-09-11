@@ -62,8 +62,8 @@ function CpAIJobFieldWork:isFinishingAllowed(message)
                 self.fieldWorkTask:setWaitingForRefillingActive()
             end
         elseif setting:getValue() == CpVehicleSettings.REFILL_ON_FIELD_ACTIVE then
-            --- TODO_25 Add driving to trailer for refilling here and so on ..
-            self.fieldWorkTask:skip()
+            --- The drive strategy will drive to a nearby fill source, refill the tank and come back.
+            self.fieldWorkTask:startRefillSequence()
         end
         return false
     end
