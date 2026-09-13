@@ -44,14 +44,6 @@ AIDriveStrategyFieldWorkCourse.normalFillLevelFullPercentage = 99.5
 
 --- How often (ms) to look again for a fill source while waiting in REFILL_WAITING.
 AIDriveStrategyFieldWorkCourse.refillSearchIntervalMs = 10 * 1000
---- Stop filling if the tank level does not increase for this long (ms).
-AIDriveStrategyFieldWorkCourse.refillNoIncreaseTimeoutMs = 10 * 1000
---- Hard limit for the total time spent filling (ms).
-AIDriveStrategyFieldWorkCourse.refillMaxFillTimeMs = 120 * 1000
---- Consider the tank full enough once it reaches this fill percentage (%).
-AIDriveStrategyFieldWorkCourse.refillFullLevelPercentage = 99
---- Refill is only considered successful once at least this much (% of the tank) was added.
-AIDriveStrategyFieldWorkCourse.refillMinFilledPercentage = 5
 --- Speed (m/s) for the slow alongside drive next to the tanker, ~4 km/h.
 AIDriveStrategyFieldWorkCourse.refillAlongsideSpeed = 4 / 3.6
 --- How far (m) to creep forward alongside the tanker while looking for the fill trigger to engage.
@@ -740,11 +732,12 @@ end
 function AIDriveStrategyFieldWorkCourse:isInRefillState()
     return self.state == self.states.REFILL_WAITING
             or self.state == self.states.REFILL_DRIVING_TO_SOURCE
+            or self.state == self.states.REFILL_DRIVING_ALONGSIDE
             or self.state == self.states.REFILL_FILLING
             or self.state == self.states.REFILL_DRIVING_BACK
 end
 
---- Start the refill sequence: raise the implements (stop spraying) and look for a fill source.
+--- Start the refill sequence: turn off and fold the implements, then look for a fill source.
 --- Called when the tank is empty and the "active" refill-on-the-field setting is on.
 function AIDriveStrategyFieldWorkCourse:startRefillSequence()
     if self:isInRefillState() then
@@ -761,14 +754,29 @@ function AIDriveStrategyFieldWorkCourse:startRefillSequence()
     self.refillFillTable = nil
     self.refillLastSearchTime = nil
     self.refillAttempt = 0
-    -- stop spraying while we are away
+    -- turn off the sprayer
+    local sprayer = self:getSprayer()
+    if sprayer and sprayer.getIsTurnedOn and sprayer:getIsTurnedOn() then
+        sprayer:setIsTurnedOn(false)
+    end
+    -- raise and fold implements for transport
     self:raiseImplements()
-    self:debug('Refill: waiting for a fill source to become available near the field.')
+    self.vehicle:prepareForAIDriving()
+    self.waitingForPrepare:set(true, 10000)
+    self:debug('Refill: preparing implements for transport, waiting for a fill source.')
     self.state = self.states.REFILL_WAITING
 end
 
 --- While parked, look for a fill source, re-checking periodically until one shows up.
+--- First waits until the implements are folded and raised (ready to drive).
 function AIDriveStrategyFieldWorkCourse:updateRefillWaiting()
+    -- wait until implements are folded/raised and the vehicle is ready to drive
+    local isReadyToDrive, blockingVehicle = self.vehicle:getIsAIReadyToDrive()
+    if not isReadyToDrive and self.waitingForPrepare:get() then
+        self:debugSparse('Refill: waiting for implements to be ready for transport (%s)',
+                blockingVehicle and CpUtil.getName(blockingVehicle) or '...')
+        return
+    end
     local now = g_time
     if self.refillLastSearchTime ~= nil and now - self.refillLastSearchTime < AIDriveStrategyFieldWorkCourse.refillSearchIntervalMs then
         return
@@ -883,12 +891,7 @@ function AIDriveStrategyFieldWorkCourse:updateRefillAlongside()
         self.refillFillTable = { [sprayer] = { [fillUnitIndex] = -1 } }
     end
     if ImplementUtil.tryAndCheckRefillingFillUnits(self.refillFillTable) then
-        local now = g_time
-        self.refillStartFillLevel = sprayer:getFillUnitFillLevel(fillUnitIndex)
-        self.refillLastFillLevel = self.refillStartFillLevel
-        self.refillLastIncreaseTime = now
-        self.refillStartTime = now
-        self:debug('Refill: fill trigger engaged, filling from level %.1f.', self.refillStartFillLevel)
+        self:debug('Refill: fill trigger engaged, filling from level %.1f.', sprayer:getFillUnitFillLevel(fillUnitIndex))
         self.state = self.states.REFILL_FILLING
     end
 end
@@ -906,11 +909,10 @@ function AIDriveStrategyFieldWorkCourse:onRefillAlongsideFinishedWithoutFill()
     self.refillLastSearchTime = nil
 end
 
---- While stopped at the source, poll the fill units until the tank is (almost) full or nothing is happening.
---- The fill transfer itself is started by the base game fill triggers, we only watch the levels and
---- decide when to stop.
+--- While stopped at the source, keep the fill transfer going and watch for it to stop.
+--- The base game fill trigger stops automatically when the target is full or the source is empty.
+--- We detect that via fillTrigger.isFilling and disambiguate with getFillUnitFreeCapacity.
 function AIDriveStrategyFieldWorkCourse:updateRefillFilling()
-    local now = g_time
     local sprayer = self:getSprayer()
     if sprayer == nil then
         self:debug('Refill: no sprayer attached while filling, resuming fieldwork.')
@@ -920,57 +922,33 @@ function AIDriveStrategyFieldWorkCourse:updateRefillFilling()
     local fillUnitIndex = sprayer:getSprayerFillUnitIndex()
     if self.refillFillTable == nil then
         self.refillFillTable = { [sprayer] = { [fillUnitIndex] = -1 } }
-        self.refillStartFillLevel = sprayer:getFillUnitFillLevel(fillUnitIndex)
-        self.refillLastFillLevel = self.refillStartFillLevel
-        self.refillLastIncreaseTime = now
-        self.refillStartTime = now
-        self:debug('Refill: starting to fill from %s, start level %.1f', CpUtil.getName(self.refillSource), self.refillStartFillLevel)
+        self:debug('Refill: filling from %s, start level %.1f', CpUtil.getName(self.refillSource),
+                sprayer:getFillUnitFillLevel(fillUnitIndex))
     end
 
     ImplementUtil.tryAndCheckRefillingFillUnits(self.refillFillTable)
+
+    local spec = sprayer.spec_fillUnit
+    if spec and spec.fillTrigger.isFilling then
+        self:debugSparse('Refill: filling, tank level %.1f', sprayer:getFillUnitFillLevel(fillUnitIndex))
+        return
+    end
+
+    -- fill transfer stopped, determine why
+    local freeCapacity = sprayer:getFillUnitFreeCapacity(fillUnitIndex)
     local curLevel = sprayer:getFillUnitFillLevel(fillUnitIndex)
-    if curLevel > self.refillLastFillLevel then
-        self.refillLastFillLevel = curLevel
-        self.refillLastIncreaseTime = now
-        self:debugSparse('Refill: tank level %.1f, filling ...', curLevel)
-    end
-
     local capacity = sprayer:getFillUnitCapacity(fillUnitIndex)
-    local fillDelta = curLevel - self.refillStartFillLevel
-    local percentageFilled = capacity > 0 and (fillDelta / capacity) * 100 or 0
-    -- absolute tank level: used to decide when the tank itself is (almost) full
     local fillPercentage = capacity > 0 and (curLevel / capacity) * 100 or 0
-    local noIncreaseTime = now - self.refillLastIncreaseTime
-    local totalFillTime = now - self.refillStartTime
+    self.refillFillTable = nil
 
-    local done = false
-    if fillPercentage >= AIDriveStrategyFieldWorkCourse.refillFullLevelPercentage then
-        self:debug('Refill: tank is full (%.1f%%), stopping fill.', fillPercentage)
-        done = true
-    elseif percentageFilled >= AIDriveStrategyFieldWorkCourse.refillMinFilledPercentage
-            and noIncreaseTime >= AIDriveStrategyFieldWorkCourse.refillNoIncreaseTimeoutMs then
-        self:debug('Refill: no fill increase for %.1f s, stopping fill (filled %.1f%%).', noIncreaseTime / 1000, percentageFilled)
-        done = true
-    elseif totalFillTime >= AIDriveStrategyFieldWorkCourse.refillMaxFillTimeMs then
-        self:debug('Refill: max fill time reached, stopping fill (filled %.1f%%).', percentageFilled)
-        done = true
-    end
-
-    if done then
-        -- cleanly end the fill transfer
-        local spec = sprayer.spec_fillUnit
-        if spec and spec.fillTrigger.isFilling then
-            sprayer:setFillUnitIsFilling(false)
-        end
-        self.refillFillTable = nil
-        if percentageFilled < AIDriveStrategyFieldWorkCourse.refillMinFilledPercentage then
-            self:debug('Refill: only %.1f%% was added, not enough. Re-searching for a fill source.', percentageFilled)
-            self.state = self.states.REFILL_WAITING
-            self.refillLastSearchTime = nil
-        else
-            self:debug('Refill: done (filled %.1f%%), driving back to the fieldwork course.', percentageFilled)
-            self:startRefillReturnPathfinding()
-        end
+    if freeCapacity <= 0 then
+        self:debug('Refill: tank is full (%.1f%%), driving back to the fieldwork course.', fillPercentage)
+        self:startRefillReturnPathfinding()
+    else
+        self:debug('Refill: fill stopped but tank has %.1f%% free, source may be empty. Re-searching.',
+                (freeCapacity / capacity) * 100)
+        self.state = self.states.REFILL_WAITING
+        self.refillLastSearchTime = nil
     end
 end
 
@@ -1012,18 +990,16 @@ function AIDriveStrategyFieldWorkCourse:onRefillReturnPathfindingDone(controller
     end
 end
 
---- Resume the fieldwork at the waypoint we left from, after the refill is done.
+--- Resume the fieldwork after the refill is done. Uses the existing "start at last waypoint"
+--- job mechanism, which remembers the best waypoint (stepped back for alignment), drives back
+--- to the field, and handles unfolding, lowering, and activating the implements.
 function AIDriveStrategyFieldWorkCourse:resumeFieldworkAfterRefill()
-    self:debug('Resuming fieldwork after refill.')
-    self.ppc:setNormalLookaheadDistance()
+    self:debug('Resuming fieldwork after refill via start-at-last-waypoint.')
     self.refillSource = nil
     self.refillSourceFillNode = nil
     self.refillSourceFillUnitIndex = nil
     self.refillFillTable = nil
-    local ix = self.refillReturnIx
-    self:startWaitingForLower()
-    self:lowerImplements()
-    self:startCourse(self.fieldWorkCourse, ix)
+    self.vehicle:startCpAtLastWp()
 end
 
 -----------------------------------------------------------------------------------------------------------------------
