@@ -26,9 +26,14 @@ RefillSourceHelper = {}
 RefillSourceHelper.debugChannel = CpDebug.DBG_FIELDWORK
 -- search for fill sources within this distance from the field
 RefillSourceHelper.maxDistanceFromField = 20
+-- sideways offset (m) kept between the vehicle and the tanker while driving alongside, clamped to this range.
+-- In reality the two vehicles would be bridged with a hose, so this is the hose working distance.
+RefillSourceHelper.refillSidewaysOffsetMin = 3
+RefillSourceHelper.refillSidewaysOffsetMax = 5
 
 --- Find the best fill source for a sprayer near the given field.
 ---@param fieldPolygon Polygon the field boundary. We look for sources on it or close to the boundary.
+--- Like SelfUnloadHelper:findBestTrailer, it must not be nil/empty.
 ---@param myVehicle table the vehicle doing the fieldwork, used for distance and to exclude its own vehicles
 ---@param sprayer table the sprayer implement that needs refilling
 ---@return table|nil source vehicle
@@ -36,12 +41,12 @@ RefillSourceHelper.maxDistanceFromField = 20
 ---@return table|nil fill root node of the source to drive to
 ---@return number|nil distance of the source from myVehicle
 function RefillSourceHelper:findBestFillSource(fieldPolygon, myVehicle, sprayer)
-    if fieldPolygon == nil or #fieldPolygon == 0 then
-        CpUtil.errorVehicle(myVehicle, 'Field polygon is nil or empty, can\'t find a fill source to refill from')
-        return nil
-    end
     if sprayer == nil or sprayer.spec_sprayer == nil then
         CpUtil.errorVehicle(myVehicle, 'No valid sprayer given, can\'t find a fill source to refill from')
+        return nil
+    end
+    if fieldPolygon == nil or #fieldPolygon == 0 then
+        CpUtil.errorVehicle(myVehicle, 'Field polygon is nil or empty, can\'t find a fill source to refill from')
         return nil
     end
 
@@ -126,4 +131,39 @@ function RefillSourceHelper:checkSource(myVehicle, fieldPolygon, source, fillUni
         end
     end
     return nil
+end
+
+--- Compute the approach geometry for driving to a fill source, modeled on
+--- SelfUnloadHelper:getTargetParameters. Returns the target node to drive to, the
+--- distance to pathfind behind it, and the sideways offset to keep alongside it.
+---@param myVehicle table the vehicle doing the fieldwork
+---@param source table the fill source vehicle (tanker)
+---@param fillRootNode number the fill root node of the source to drive to
+---@return number target node to drive to
+---@return number alignLength how far behind the target to pathfind
+---@return number offsetX sideways offset to keep alongside the target (3-5 m)
+---@return table the source vehicle
+function RefillSourceHelper:getTargetParameters(myVehicle, source, fillRootNode)
+    local targetNode = fillRootNode or source.rootNode
+    local sourceLength = source.size and source.size.length or 10
+    local sourceWidth = source.size and source.size.width or 4
+
+    -- keep to the side of the source the vehicle is already on, so it doesn't have to cross it
+    local dx = localToLocal(myVehicle:getAIDirectionNode(), targetNode, 0, 0, 0)
+    local sideSign = dx >= 0 and 1 or -1
+
+    -- sideways offset, clamped to 3-5 m (in reality the two would be bridged with a hose)
+    local offsetX = CpMathUtil.clamp(sourceWidth / 2 + myVehicle.size.width / 2 + 1,
+            RefillSourceHelper.refillSidewaysOffsetMin, RefillSourceHelper.refillSidewaysOffsetMax)
+    offsetX = offsetX * sideSign
+
+    -- how far behind the source to pathfind, so the vehicle can align and drive alongside
+    local _, steeringLength = AIUtil.getSteeringParameters(myVehicle)
+    local _, frontMarkerOffset = Markers.getFrontMarkerNode(myVehicle)
+    local alignLength = (sourceLength / 2) + math.max(myVehicle.size.length / 2 + frontMarkerOffset, steeringLength)
+
+    CpUtil.debugVehicle(self.debugChannel, myVehicle,
+            'Refill target: source length %.1f, width %.1f, align length %.1f, offset %.1f (side %s)',
+            sourceLength, sourceWidth, alignLength, offsetX, sideSign > 0 and 'left' or 'right')
+    return targetNode, alignLength, offsetX, source
 end
