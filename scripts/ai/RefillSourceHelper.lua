@@ -119,11 +119,13 @@ function RefillSourceHelper:checkSource(myVehicle, fieldPolygon, source, fillUni
     local capacity = source:getFillUnitCapacity(fillUnitIndex)
     local fillLevel = source:getFillUnitFillLevel(fillUnitIndex)
     local hasFluid = capacity > 0 and fillLevel > 0
+    local isInvalidAdTarget = rootVehicle and rootVehicle.ad and rootVehicle.ad.stateModule
+            and rootVehicle.ad.stateModule:isActive() and not rootVehicle.ad.drivePathModule:isTargetReached()
     CpUtil.debugVehicle(self.debugChannel, myVehicle,
-            'Fill source candidate %s (fill unit %s): on field %s, closest distance %.1f, root vehicle %s, last speed %.1f, CP active %s, fill level %.1f/%.1f',
+            'Fill source candidate %s (fill unit %s): on field %s, closest distance %.1f, root vehicle %s, last speed %.1f, CP active %s, AD target %s, fill level %.1f/%.1f',
             CpUtil.getName(source), fillUnitIndex, isOnField and '' or 'NOT', closestDistance,
-            rootVehicle and CpUtil.getName(rootVehicle) or 'none', lastSpeed, isCpActive, fillLevel, capacity)
-    if isOnField and rootVehicle ~= myVehicle and not isCpActive and lastSpeed < 0.1 and hasFluid then
+            rootVehicle and CpUtil.getName(rootVehicle) or 'none', lastSpeed, isCpActive, isInvalidAdTarget and 'yes' or 'no', fillLevel, capacity)
+    if isOnField and rootVehicle ~= myVehicle and not isCpActive and lastSpeed < 0.1 and hasFluid and not isInvalidAdTarget then
         local fillRootNode = source:getFillUnitExactFillRootNode(fillUnitIndex)
         if fillRootNode then
             local d = calcDistanceFrom(myVehicle:getAIDirectionNode(), source.rootNode or source.nodeId)
