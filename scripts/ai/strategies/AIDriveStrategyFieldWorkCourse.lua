@@ -419,8 +419,12 @@ function AIDriveStrategyFieldWorkCourse:onLastWaypointPassed()
     elseif self.state == self.states.REFILL_DRIVING_ALONGSIDE then
         self:onRefillAlongsideFinishedWithoutFill()
     elseif self.state == self.states.REFILL_DRIVING_BACK then
-        self:debug('Back at the fieldwork, resuming work.')
-        self:resumeFieldworkAfterRefill()
+        self:debug('Back from refill, resuming fieldwork at waypoint %d.', self.refillReturnIx)
+        self.ppc:setNormalLookaheadDistance()
+        self:startWaitingForLower()
+        self:lowerImplements()
+        self:startCourse(self.fieldWorkCourse, self.refillReturnIx)
+        self.state = self.states.INITIAL
     else
         -- by default, stop the job
         self:finishFieldWork()
@@ -746,8 +750,7 @@ function AIDriveStrategyFieldWorkCourse:startRefillSequence()
     end
     self:debug('Starting refill sequence, currently at fieldwork waypoint %s',
             self.fieldWorkCourse and self.fieldWorkCourse:getCurrentWaypointIx())
-    ---@type number|nil
-    self.refillReturnIx = self.fieldWorkCourse and self.fieldWorkCourse:getCurrentWaypointIx()
+    self.refillReturnIx = self:getBestWaypointToContinueFieldWork()
     self.refillSource = nil
     self.refillSourceFillNode = nil
     self.refillSourceFillUnitIndex = nil
@@ -882,8 +885,8 @@ end
 function AIDriveStrategyFieldWorkCourse:updateRefillAlongside()
     local sprayer = self:getSprayer()
     if sprayer == nil then
-        self:debug('Refill: no sprayer attached while driving alongside, resuming fieldwork.')
-        self:resumeFieldworkAfterRefill()
+        self:debug('Refill: no sprayer attached while driving alongside, driving back to fieldwork.')
+        self:startRefillReturnPathfinding()
         return
     end
     local fillUnitIndex = sprayer:getSprayerFillUnitIndex()
@@ -915,7 +918,7 @@ end
 function AIDriveStrategyFieldWorkCourse:updateRefillFilling()
     local sprayer = self:getSprayer()
     if sprayer == nil then
-        self:debug('Refill: no sprayer attached while filling, resuming fieldwork.')
+        self:debug('Refill: no sprayer attached while filling, driving back to fieldwork.')
         self:startRefillReturnPathfinding()
         return
     end
@@ -942,7 +945,7 @@ function AIDriveStrategyFieldWorkCourse:updateRefillFilling()
     self.refillFillTable = nil
 
     if freeCapacity <= 0 then
-        self:debug('Refill: tank is full (%.1f%%), driving back to the fieldwork course.', fillPercentage)
+        self:debug('Refill: tank is full (%.1f%%), driving back to fieldwork.', fillPercentage)
         self:startRefillReturnPathfinding()
     else
         self:debug('Refill: fill stopped but tank has %.1f%% free, source may be empty. Re-searching.',
@@ -952,8 +955,14 @@ function AIDriveStrategyFieldWorkCourse:updateRefillFilling()
     end
 end
 
---- Pathfind back to the fieldwork course waypoint we left from.
+--- Pathfind back to the fieldwork course waypoint we left from, then use a StartRowOnly
+--- alignment to arrive with the correct orientation and resume work (same pattern as the combine
+--- self-unload return).
 function AIDriveStrategyFieldWorkCourse:startRefillReturnPathfinding()
+    self.refillSource = nil
+    self.refillSourceFillNode = nil
+    self.refillSourceFillUnitIndex = nil
+    self.refillFillTable = nil
     if self.fieldWorkCourse == nil or self.refillReturnIx == nil then
         self:debug('Refill: no fieldwork course to return to, stopping the job.')
         self.vehicle:stopCurrentAIJob(AIMessageSuccessFinishedJob.new())
@@ -970,36 +979,42 @@ end
 
 function AIDriveStrategyFieldWorkCourse:onRefillReturnPathfindingFailed(controller, lastContext, wasLastRetry, currentRetryAttempt)
     if wasLastRetry then
-        self:debug('Refill: pathfinding back to the fieldwork failed, resuming fieldwork directly.')
-        self:resumeFieldworkAfterRefill()
+        self:debug('Refill: pathfinding back to fieldwork failed, stopping the job.')
+        self.vehicle:stopCurrentAIJob(AIMessageSuccessFinishedJob.new())
     else
-        self:debug('Refill: pathfinding back to the fieldwork failed once, retry with disabled collisions.')
+        self:debug('Refill: pathfinding back to fieldwork failed once, retry with disabled collisions.')
         lastContext:collisionMask(0)
         controller:retry(lastContext)
     end
 end
 
 function AIDriveStrategyFieldWorkCourse:onRefillReturnPathfindingDone(controller, success, course, goalNodeInvalid)
-    if success then
-        self:debug('Refill: pathfinding back to the fieldwork finished, driving back.')
+    local ix = self.refillReturnIx
+    local fm, bm = self:getFrontAndBackMarkers()
+    self.turnContext = RowStartOrFinishContext(self.vehicle, self.fieldWorkCourse, ix, ix, self.turnNodes,
+            self:getWorkWidth(), fm, bm, 0, 0)
+    if success and course then
+        self:debug('Refill: pathfinding back to fieldwork finished, driving return course.')
         self.state = self.states.REFILL_DRIVING_BACK
-        self:startCourse(course, 1)
+        self.ppc:setShortLookaheadDistance()
+        course:adjustForTowedImplements(2)
+        self.workStarter = StartRowOnly(self.vehicle, self, self.ppc, self.turnContext, course)
+        self:startCourse(self.workStarter:getCourse(), 1)
     else
-        self:debug('Refill: pathfinding back to the fieldwork failed, resuming fieldwork directly.')
-        self:resumeFieldworkAfterRefill()
+        self:debug('Refill: no path found, using alignment course to fieldwork waypoint %d.', ix)
+        local returnCourse = AlignmentCourse(self.vehicle, self.vehicle:getAIDirectionNode(),
+                self.turningRadius, self.fieldWorkCourse, ix, 0):getCourse()
+        if returnCourse then
+            self.state = self.states.REFILL_DRIVING_BACK
+            self.ppc:setShortLookaheadDistance()
+            self.workStarter = StartRowOnly(self.vehicle, self, self.ppc, self.turnContext, returnCourse)
+            self:startCourse(self.workStarter:getCourse(), 1)
+        else
+            self:debug('Refill: could not create alignment course, starting fieldwork directly.')
+            self:startCourse(self.fieldWorkCourse, ix)
+            self.state = self.states.INITIAL
+        end
     end
-end
-
---- Resume the fieldwork after the refill is done. Uses the existing "start at last waypoint"
---- job mechanism, which remembers the best waypoint (stepped back for alignment), drives back
---- to the field, and handles unfolding, lowering, and activating the implements.
-function AIDriveStrategyFieldWorkCourse:resumeFieldworkAfterRefill()
-    self:debug('Resuming fieldwork after refill via start-at-last-waypoint.')
-    self.refillSource = nil
-    self.refillSourceFillNode = nil
-    self.refillSourceFillUnitIndex = nil
-    self.refillFillTable = nil
-    self.vehicle:startCpAtLastWp()
 end
 
 -----------------------------------------------------------------------------------------------------------------------
