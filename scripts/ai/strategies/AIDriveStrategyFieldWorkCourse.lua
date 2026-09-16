@@ -35,8 +35,7 @@ AIDriveStrategyFieldWorkCourse.myStates = {
     DRIVING_TO_WORK_START_WAYPOINT = { showTurnContextDebug = true },
     REFILL_WAITING = {},
     REFILL_DRIVING_TO_SOURCE = {},
-    REFILL_DRIVING_ALONGSIDE = {},
-    REFILL_FILLING = {},
+    REFILL_AT_SOURCE = {},
     REFILL_DRIVING_BACK = {},
 }
 
@@ -231,14 +230,10 @@ function AIDriveStrategyFieldWorkCourse:getDriveData(dt, vX, vY, vZ)
     elseif self.state == self.states.REFILL_WAITING then
         self:setMaxSpeed(0)
         self:updateRefillWaiting()
-    elseif self.state == self.states.REFILL_FILLING then
-        self:setMaxSpeed(0)
-        self:updateRefillFilling()
     elseif self.state == self.states.REFILL_DRIVING_TO_SOURCE then
         self:setMaxSpeed(self.settings.fieldSpeed:getValue())
-    elseif self.state == self.states.REFILL_DRIVING_ALONGSIDE then
-        self:setMaxSpeed(AIDriveStrategyFieldWorkCourse.refillAlongsideSpeed)
-        self:updateRefillAlongside()
+    elseif self.state == self.states.REFILL_AT_SOURCE then
+        self:updateRefillAtSource()
     elseif self.state == self.states.REFILL_DRIVING_BACK then
         self:setMaxSpeed(self.settings.fieldSpeed:getValue())
     end
@@ -412,11 +407,12 @@ function AIDriveStrategyFieldWorkCourse:onLastWaypointPassed()
     elseif self.state == self.states.DRIVING_TO_WORK_START_WAYPOINT then
         self.workStarter:onLastWaypoint()
     elseif self.state == self.states.REFILL_DRIVING_TO_SOURCE then
-        self:debug('Reached the approach position, driving alongside the tanker.')
-        self.refillFillTable = nil
-        self.state = self.states.REFILL_DRIVING_ALONGSIDE
+        self:debug('Reached the approach position, trying to fill.')
+        self.refillFillWasActive = false
+        self.refillReadyToFill = true
+        self.state = self.states.REFILL_AT_SOURCE
         self:startRefillAlongsideDrive()
-    elseif self.state == self.states.REFILL_DRIVING_ALONGSIDE then
+    elseif self.state == self.states.REFILL_AT_SOURCE then
         self:onRefillAlongsideFinishedWithoutFill()
     elseif self.state == self.states.REFILL_DRIVING_BACK then
         self:debug('Back from refill, resuming fieldwork at waypoint %d.', self.refillReturnIx)
@@ -736,8 +732,7 @@ end
 function AIDriveStrategyFieldWorkCourse:isInRefillState()
     return self.state == self.states.REFILL_WAITING
             or self.state == self.states.REFILL_DRIVING_TO_SOURCE
-            or self.state == self.states.REFILL_DRIVING_ALONGSIDE
-            or self.state == self.states.REFILL_FILLING
+            or self.state == self.states.REFILL_AT_SOURCE
             or self.state == self.states.REFILL_DRIVING_BACK
 end
 
@@ -754,9 +749,10 @@ function AIDriveStrategyFieldWorkCourse:startRefillSequence()
     self.refillSource = nil
     self.refillSourceFillNode = nil
     self.refillSourceFillUnitIndex = nil
-    self.refillFillTable = nil
     self.refillLastSearchTime = nil
     self.refillAttempt = 0
+    self.refillFillWasActive = false
+    self.refillReadyToFill = false
     -- turn off the sprayer
     local sprayer = self:getSprayer()
     if sprayer and sprayer.getIsTurnedOn and sprayer:getIsTurnedOn() then
@@ -827,23 +823,13 @@ function AIDriveStrategyFieldWorkCourse:startRefillPathfindingToSource()
     local targetNode, alignLength, offsetX = RefillSourceHelper:getTargetParameters(
             self.vehicle, self.refillSource, self.refillSourceFillNode)
 
-    -- if we are already right next to the source, try to fill directly, otherwise creep alongside
+    -- if we are already right next to the source, skip the approach drive
     local distToSource = calcDistanceFrom(self.vehicle:getAIDirectionNode(), self.refillSource.rootNode)
     if distToSource <= AIDriveStrategyFieldWorkCourse.refillAlongsideSkipDistance then
-        self:debug('Refill: already close to the fill source (%.1f m), trying to fill directly.', distToSource)
-        local sprayer = self:getSprayer()
-        if sprayer then
-            local fillUnitIndex = sprayer:getSprayerFillUnitIndex()
-            self.refillFillTable = { [sprayer] = { [fillUnitIndex] = -1 } }
-            if ImplementUtil.tryAndCheckRefillingFillUnits(self.refillFillTable) then
-                self:debug('Refill: fill trigger engaged immediately, filling from level %.1f.',
-                        sprayer:getFillUnitFillLevel(fillUnitIndex))
-                self.state = self.states.REFILL_FILLING
-                return
-            end
-        end
-        self:debug('Refill: fill trigger not engaged, driving alongside to find it.')
-        self.state = self.states.REFILL_DRIVING_ALONGSIDE
+        self:debug('Refill: already close to the fill source (%.1f m).', distToSource)
+        self.refillFillWasActive = false
+        self.refillReadyToFill = true
+        self.state = self.states.REFILL_AT_SOURCE
         self:startRefillAlongsideDrive()
         return
     end
@@ -889,8 +875,7 @@ end
 
 --- Drive a short straight course forward alongside the tanker. After the align course the vehicle
 --- is already parallel to the tanker, so a straight forward course creeps it towards the spout.
---- The speed is limited to a slow crawl (set in getDriveData); the fill is started as soon as the
---- fill trigger engages (see updateRefillAlongside).
+--- The speed is managed by updateRefillAtSource (0 when filling, alongside speed when not).
 function AIDriveStrategyFieldWorkCourse:startRefillAlongsideDrive()
     local distance = AIDriveStrategyFieldWorkCourse.refillAlongsideMaxDistance
     self:debug('Refill: driving alongside the tanker (%.1f m) at %.1f km/h.', distance,
@@ -898,22 +883,97 @@ function AIDriveStrategyFieldWorkCourse:startRefillAlongsideDrive()
     self:startCourse(Course.createStraightForwardCourse(self.vehicle, distance), 1)
 end
 
---- While creeping alongside the tanker, keep trying to start the fill. As soon as the fill trigger
---- engages (the two fill units are in range), stop driving and hand over to the filling state.
-function AIDriveStrategyFieldWorkCourse:updateRefillAlongside()
+--- Try to engage the fill trigger on the sprayer using the guarded setFillUnitIsFilling pattern.
+--- Returns true if the fill is now active.
+function AIDriveStrategyFieldWorkCourse:tryStartFill(sprayer)
+    local spec = sprayer.spec_fillUnit
+    if not spec or not spec.fillTrigger or not spec.fillTrigger.triggers then
+        return false
+    end
+    if #spec.fillTrigger.triggers == 0 then
+        return false
+    end
+    for _, trigger in ipairs(spec.fillTrigger.triggers) do
+        if trigger:getIsActivatable(self.vehicle) then
+            if not spec.fillTrigger.isFilling then
+                spec:setFillUnitIsFilling(true)
+            end
+        end
+    end
+    return spec.fillTrigger.isFilling
+end
+
+--- Unified at-source logic: try to engage fill, stop if successful, otherwise either
+--- creep forward (fill never engaged) or wait in place (fill was active but stopped).
+function AIDriveStrategyFieldWorkCourse:updateRefillAtSource()
     local sprayer = self:getSprayer()
     if sprayer == nil then
-        self:debug('Refill: no sprayer attached while driving alongside, driving back to fieldwork.')
+        self:debug('Refill: no sprayer attached, driving back to fieldwork.')
         self:startRefillReturnPathfinding()
         return
     end
     local fillUnitIndex = sprayer:getSprayerFillUnitIndex()
-    if self.refillFillTable == nil then
-        self.refillFillTable = { [sprayer] = { [fillUnitIndex] = -1 } }
+    local fillLevel = sprayer:getFillUnitFillLevel(fillUnitIndex)
+    local capacity = sprayer:getFillUnitCapacity(fillUnitIndex)
+    local fillPercentage = capacity > 0 and (fillLevel / capacity) * 100 or 0
+
+    -- Try to engage/continue fill (only at a confirmed source, tank has room)
+    if self.refillReadyToFill and fillLevel < capacity and self:tryStartFill(sprayer) then
+        self:setMaxSpeed(0)
+        self.refillFillWasActive = true
+        self:debugSparse('Refill: filling, tank level %.1f', fillLevel)
+        return
     end
-    if ImplementUtil.tryAndCheckRefillingFillUnits(self.refillFillTable) then
-        self:debug('Refill: fill trigger engaged, filling from level %.1f.', sprayer:getFillUnitFillLevel(fillUnitIndex))
-        self.state = self.states.REFILL_FILLING
+
+    -- Fill is not active. Release trigger if we were filling.
+    if self.refillFillWasActive then
+        local spec = sprayer.spec_fillUnit
+        if spec and spec.fillTrigger then
+            spec:setFillUnitIsFilling(false)
+        end
+    end
+
+    -- Fill has stopped. Drive back if tank is full enough.
+    if fillPercentage >= 80 then
+        self:debug('Refill: fill stopped, tank at %.1f%%, driving back to fieldwork.', fillPercentage)
+        self.refillReadyToFill = false
+        self:startRefillReturnPathfinding()
+        return
+    end
+
+    -- Tank not full enough.
+    if self.refillReadyToFill and not self.refillFillWasActive then
+        -- Fill never engaged, creep forward to find trigger
+        self:setMaxSpeed(AIDriveStrategyFieldWorkCourse.refillAlongsideSpeed)
+    else
+        -- Source empty or not at confirmed source. Wait + search.
+        self.refillReadyToFill = false
+        self:setMaxSpeed(0)
+        self:updateRefillSourceSearch(sprayer)
+    end
+end
+
+--- Periodically search for a fill source while waiting at the current (empty) source.
+function AIDriveStrategyFieldWorkCourse:updateRefillSourceSearch(sprayer)
+    local now = g_time
+    if self.refillLastSearchTime ~= nil and now - self.refillLastSearchTime < AIDriveStrategyFieldWorkCourse.refillSearchIntervalMs then
+        return
+    end
+    self.refillLastSearchTime = now
+    local fieldPolygon = self.vehicle:cpGetFieldPolygon()
+    if fieldPolygon == nil or #fieldPolygon == 0 then
+        return
+    end
+    local source, fillUnitIndex, fillNode, distance = RefillSourceHelper:findBestFillSource(fieldPolygon, self.vehicle, sprayer)
+    if source then
+        self:debug('Refill: found new source %s at %.1f m, driving to it.', CpUtil.getName(source), distance)
+        self.refillSource = source
+        self.refillSourceFillNode = fillNode
+        self.refillSourceFillUnitIndex = fillUnitIndex
+        self.refillFillWasActive = false
+        self:startRefillPathfindingToSource()
+    else
+        self.refillSource = nil
     end
 end
 
@@ -930,49 +990,6 @@ function AIDriveStrategyFieldWorkCourse:onRefillAlongsideFinishedWithoutFill()
     self.refillLastSearchTime = nil
 end
 
---- While stopped at the source, keep the fill transfer going and watch for it to stop.
---- The base game fill trigger stops automatically when the target is full or the source is empty.
---- We detect that via fillTrigger.isFilling and disambiguate with getFillUnitFreeCapacity.
-function AIDriveStrategyFieldWorkCourse:updateRefillFilling()
-    local sprayer = self:getSprayer()
-    if sprayer == nil then
-        self:debug('Refill: no sprayer attached while filling, driving back to fieldwork.')
-        self:startRefillReturnPathfinding()
-        return
-    end
-    local fillUnitIndex = sprayer:getSprayerFillUnitIndex()
-    if self.refillFillTable == nil then
-        self.refillFillTable = { [sprayer] = { [fillUnitIndex] = -1 } }
-        self:debug('Refill: filling from %s, start level %.1f', CpUtil.getName(self.refillSource),
-                sprayer:getFillUnitFillLevel(fillUnitIndex))
-    end
-
-    ImplementUtil.tryAndCheckRefillingFillUnits(self.refillFillTable)
-
-    local spec = sprayer.spec_fillUnit
-    if spec and spec.fillTrigger.isFilling then
-        self:debugSparse('Refill: filling, tank level %.1f', sprayer:getFillUnitFillLevel(fillUnitIndex))
-        return
-    end
-
-    -- fill transfer stopped, determine why
-    local freeCapacity = sprayer:getFillUnitFreeCapacity(fillUnitIndex)
-    local curLevel = sprayer:getFillUnitFillLevel(fillUnitIndex)
-    local capacity = sprayer:getFillUnitCapacity(fillUnitIndex)
-    local fillPercentage = capacity > 0 and (curLevel / capacity) * 100 or 0
-    self.refillFillTable = nil
-
-    if capacity > 0 and freeCapacity <= capacity * 0.2 then
-        self:debug('Refill: tank at %.1f%% (free capacity below 20%%), driving back to fieldwork.', fillPercentage)
-        self:startRefillReturnPathfinding()
-    else
-        self:debug('Refill: fill stopped but tank has %.1f%% free, source may be empty. Re-searching.',
-                capacity > 0 and (freeCapacity / capacity) * 100 or 0)
-        self.state = self.states.REFILL_WAITING
-        self.refillLastSearchTime = nil
-    end
-end
-
 --- Pathfind back to the fieldwork course waypoint we left from, then use a StartRowOnly
 --- alignment to arrive with the correct orientation and resume work (same pattern as the combine
 --- self-unload return).
@@ -980,7 +997,6 @@ function AIDriveStrategyFieldWorkCourse:startRefillReturnPathfinding()
     self.refillSource = nil
     self.refillSourceFillNode = nil
     self.refillSourceFillUnitIndex = nil
-    self.refillFillTable = nil
     if self.fieldWorkCourse == nil or self.refillReturnIx == nil then
         self:debug('Refill: no fieldwork course to return to, stopping the job.')
         self.vehicle:stopCurrentAIJob(AIMessageSuccessFinishedJob.new())
