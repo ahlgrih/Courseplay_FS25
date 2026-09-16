@@ -408,12 +408,17 @@ function AIDriveStrategyFieldWorkCourse:onLastWaypointPassed()
         self.workStarter:onLastWaypoint()
     elseif self.state == self.states.REFILL_DRIVING_TO_SOURCE then
         self:debug('Reached the approach position, trying to fill.')
-        self.refillFillWasActive = false
-        self.refillReadyToFill = true
+        self.refillLastFillLevel = nil
+        self.refillLastFillTime = nil
+        self.refillFillStarted = false
         self.state = self.states.REFILL_AT_SOURCE
         self:startRefillAlongsideDrive()
     elseif self.state == self.states.REFILL_AT_SOURCE then
-        self:onRefillAlongsideFinishedWithoutFill()
+        if self.refillFillStarted then
+            self:debug('Refill: alongside course ended, fill still active.')
+        else
+            self:onRefillAlongsideFinishedWithoutFill()
+        end
     elseif self.state == self.states.REFILL_DRIVING_BACK then
         self:debug('Back from refill, resuming fieldwork at waypoint %d.', self.refillReturnIx)
         self.ppc:setNormalLookaheadDistance()
@@ -751,8 +756,9 @@ function AIDriveStrategyFieldWorkCourse:startRefillSequence()
     self.refillSourceFillUnitIndex = nil
     self.refillLastSearchTime = nil
     self.refillAttempt = 0
-    self.refillFillWasActive = false
-    self.refillReadyToFill = false
+    self.refillLastFillLevel = nil
+    self.refillLastFillTime = nil
+    self.refillFillStarted = false
     -- turn off the sprayer
     local sprayer = self:getSprayer()
     if sprayer and sprayer.getIsTurnedOn and sprayer:getIsTurnedOn() then
@@ -827,8 +833,9 @@ function AIDriveStrategyFieldWorkCourse:startRefillPathfindingToSource()
     local distToSource = calcDistanceFrom(self.vehicle:getAIDirectionNode(), self.refillSource.rootNode)
     if distToSource <= AIDriveStrategyFieldWorkCourse.refillAlongsideSkipDistance then
         self:debug('Refill: already close to the fill source (%.1f m).', distToSource)
-        self.refillFillWasActive = false
-        self.refillReadyToFill = true
+        self.refillLastFillLevel = nil
+        self.refillLastFillTime = nil
+        self.refillFillStarted = false
         self.state = self.states.REFILL_AT_SOURCE
         self:startRefillAlongsideDrive()
         return
@@ -903,8 +910,10 @@ function AIDriveStrategyFieldWorkCourse:tryStartFill(sprayer)
     return spec.fillTrigger.isFilling
 end
 
---- Unified at-source logic: try to engage fill, stop if successful, otherwise either
---- creep forward (fill never engaged) or wait in place (fill was active but stopped).
+--- At-source logic using fill-level monitoring. We watch the sprayer's fill level:
+--- if it increases we are filling; if it is constant for 5s the fill has stopped.
+--- This is more robust than checking trigger states, which can be unreliable
+--- (e.g. AD starts/stops the fill independently of our code).
 function AIDriveStrategyFieldWorkCourse:updateRefillAtSource()
     local sprayer = self:getSprayer()
     if sprayer == nil then
@@ -917,40 +926,50 @@ function AIDriveStrategyFieldWorkCourse:updateRefillAtSource()
     local capacity = sprayer:getFillUnitCapacity(fillUnitIndex)
     local fillPercentage = capacity > 0 and (fillLevel / capacity) * 100 or 0
 
-    -- Try to engage/continue fill (only at a confirmed source, tank has room)
-    if self.refillReadyToFill and fillLevel < capacity and self:tryStartFill(sprayer) then
+    local now = g_time
+
+    -- Initialize monitoring on first frame, try to start fill
+    if self.refillLastFillLevel == nil then
+        self.refillLastFillLevel = fillLevel
+        self.refillLastFillTime = now
+        if fillLevel < capacity then
+            self:tryStartFill(sprayer)
+        end
+        return
+    end
+
+    -- Fill level increased → filling, stop driving
+    if fillLevel > self.refillLastFillLevel then
+        self.refillLastFillLevel = fillLevel
+        self.refillLastFillTime = now
+        self.refillFillStarted = true
         self:setMaxSpeed(0)
-        self.refillFillWasActive = true
         self:debugSparse('Refill: filling, tank level %.1f', fillLevel)
         return
     end
 
-    -- Fill is not active. Release trigger if we were filling.
-    if self.refillFillWasActive then
-        local spec = sprayer.spec_fillUnit
-        if spec and spec.fillTrigger then
-            spec:setFillUnitIsFilling(false)
+    -- Fill level constant < 5s → let current behavior continue
+    if now - self.refillLastFillTime < 5 then
+        if not self.refillFillStarted then
+            self:setMaxSpeed(AIDriveStrategyFieldWorkCourse.refillAlongsideSpeed)
         end
-    end
-
-    -- Fill has stopped. Drive back if tank is full enough.
-    if fillPercentage >= 80 then
-        self:debug('Refill: fill stopped, tank at %.1f%%, driving back to fieldwork.', fillPercentage)
-        self.refillReadyToFill = false
-        self:startRefillReturnPathfinding()
         return
     end
 
-    -- Tank not full enough.
-    if self.refillReadyToFill and not self.refillFillWasActive then
-        -- Fill never engaged, creep forward to find trigger
-        self:setMaxSpeed(AIDriveStrategyFieldWorkCourse.refillAlongsideSpeed)
-    else
-        -- Source empty or not at confirmed source. Wait + search.
-        self.refillReadyToFill = false
-        self:setMaxSpeed(0)
-        self:updateRefillSourceSearch(sprayer)
+    -- Fill level constant for 5s
+    if self.refillFillStarted then
+        -- Fill was active but stopped
+        self:debug('Refill: fill stopped, tank %.1f%%', fillPercentage)
+        if fillPercentage >= 80 then
+            self:startRefillReturnPathfinding()
+        else
+            self:setMaxSpeed(0)
+            self:updateRefillSourceSearch(sprayer)
+        end
+        return
     end
+    -- Fill never started → alongside drive still running, let it finish
+    -- onLastWaypointPassed will handle retry/give-up
 end
 
 --- Periodically search for a fill source while waiting at the current (empty) source.
@@ -970,7 +989,9 @@ function AIDriveStrategyFieldWorkCourse:updateRefillSourceSearch(sprayer)
         self.refillSource = source
         self.refillSourceFillNode = fillNode
         self.refillSourceFillUnitIndex = fillUnitIndex
-        self.refillFillWasActive = false
+        self.refillLastFillLevel = nil
+        self.refillLastFillTime = nil
+        self.refillFillStarted = false
         self:startRefillPathfindingToSource()
     else
         self.refillSource = nil
